@@ -27,48 +27,55 @@ class SoftSplit(nn.Module):
         c_in = reduce((lambda x, y: x * y), kernel_size) * channel
         self.embedding = nn.Linear(c_in, hidden)
 
-        self.f_h = int(
-            (t2t_param['output_size'][0] + 2 * t2t_param['padding'][0] -
-             (t2t_param['kernel_size'][0] - 1) - 1) / t2t_param['stride'][0] +
-            1)
-        self.f_w = int(
-            (t2t_param['output_size'][1] + 2 * t2t_param['padding'][1] -
-             (t2t_param['kernel_size'][1] - 1) - 1) / t2t_param['stride'][1] +
-            1)
+        self.t2t_param = t2t_param
 
-    def forward(self, x, b):
+    def forward(self, x, b, output_size):
+        f_h = int((output_size[0] + 2 * self.t2t_param['padding'][0] -
+                   (self.t2t_param['kernel_size'][0] - 1) - 1) /
+                  self.t2t_param['stride'][0] + 1)
+        f_w = int((output_size[1] + 2 * self.t2t_param['padding'][1] -
+                   (self.t2t_param['kernel_size'][1] - 1) - 1) /
+                  self.t2t_param['stride'][1] + 1)
+
         feat = self.t2t(x)
         feat = feat.permute(0, 2, 1)
         # feat shape [b*t, num_vec, ks*ks*c]
         feat = self.embedding(feat)
         # feat shape after embedding [b, t*num_vec, hidden]
-        feat = feat.view(b, -1, self.f_h, self.f_w, feat.size(2))
+        feat = feat.view(b, -1, f_h, f_w, feat.size(2))
         return feat
 
 
 class SoftComp(nn.Module):
-    def __init__(self, channel, hidden, output_size, kernel_size, stride,
-                 padding):
+    def __init__(self, channel, hidden, kernel_size, stride, padding):
         super(SoftComp, self).__init__()
         self.relu = nn.LeakyReLU(0.2, inplace=True)
         c_out = reduce((lambda x, y: x * y), kernel_size) * channel
         self.embedding = nn.Linear(hidden, c_out)
-        self.t2t = torch.nn.Fold(output_size=output_size,
-                                 kernel_size=kernel_size,
-                                 stride=stride,
-                                 padding=padding)
-        h, w = output_size
-        self.bias = nn.Parameter(torch.zeros((channel, h, w),
-                                             dtype=torch.float32),
-                                 requires_grad=True)
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.bias_conv = nn.Conv2d(channel,
+                                   channel,
+                                   kernel_size=3,
+                                   stride=1,
+                                   padding=1)
+        # TODO upsample conv
+        # self.bias_conv = nn.Conv2d()
+        # self.bias = nn.Parameter(torch.zeros((channel, h, w), dtype=torch.float32), requires_grad=True)
 
-    def forward(self, x, t):
+    def forward(self, x, t, output_size):
         b_, _, _, _, c_ = x.shape
         x = x.view(b_, -1, c_)
         feat = self.embedding(x)
         b, _, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)
-        feat = self.t2t(feat) + self.bias[None]
+        feat = F.fold(feat,
+                      output_size=output_size,
+                      kernel_size=self.kernel_size,
+                      stride=self.stride,
+                      padding=self.padding)
+        feat = self.bias_conv(feat)
         return feat
 
 
@@ -80,20 +87,34 @@ class FusionFeedForward(nn.Module):
         self.conv1 = nn.Sequential(nn.Linear(d_model, hd))
         self.conv2 = nn.Sequential(nn.GELU(), nn.Linear(hd, d_model))
         assert t2t_params is not None and n_vecs is not None
-        tp = t2t_params.copy()
-        self.fold = nn.Fold(**tp)
-        del tp['output_size']
-        self.unfold = nn.Unfold(**tp)
-        self.n_vecs = n_vecs
+        self.t2t_params = t2t_params
 
-    def forward(self, x):
+    def forward(self, x, output_size):
+        n_vecs = 1
+        for i, d in enumerate(self.t2t_params['kernel_size']):
+            n_vecs *= int((output_size[i] + 2 * self.t2t_params['padding'][i] -
+                           (d - 1) - 1) / self.t2t_params['stride'][i] + 1)
+
         x = self.conv1(x)
         b, n, c = x.size()
-        normalizer = x.new_ones(b, n, 49).view(-1, self.n_vecs,
-                                               49).permute(0, 2, 1)
-        x = self.unfold(
-            self.fold(x.view(-1, self.n_vecs, c).permute(0, 2, 1)) /
-            self.fold(normalizer)).permute(0, 2, 1).contiguous().view(b, n, c)
+        normalizer = x.new_ones(b, n, 49).view(-1, n_vecs, 49).permute(0, 2, 1)
+        normalizer = F.fold(normalizer,
+                            output_size=output_size,
+                            kernel_size=self.t2t_params['kernel_size'],
+                            padding=self.t2t_params['padding'],
+                            stride=self.t2t_params['stride'])
+
+        x = F.fold(x.view(-1, n_vecs, c).permute(0, 2, 1),
+                   output_size=output_size,
+                   kernel_size=self.t2t_params['kernel_size'],
+                   padding=self.t2t_params['padding'],
+                   stride=self.t2t_params['stride'])
+
+        x = F.unfold(x / normalizer,
+                     kernel_size=self.t2t_params['kernel_size'],
+                     padding=self.t2t_params['padding'],
+                     stride=self.t2t_params['stride']).permute(
+                         0, 2, 1).contiguous().view(b, n, c)
         x = self.conv2(x)
         return x
 
@@ -292,8 +313,9 @@ class WindowAttention(nn.Module):
             v_pooled = []
             for k in range(self.focal_level - 1):
                 stride = 2**k
-                x_window_pooled = x_all[k + 1].permute(
-                    0, 3, 1, 2, 4).contiguous()  # B, T, nWh, nWw, C
+                # B, T, nWh, nWw, C
+                x_window_pooled = x_all[k + 1].permute(0, 3, 1, 2,
+                                                       4).contiguous()
 
                 nWh, nWw = x_window_pooled.shape[2:4]
 
@@ -320,17 +342,21 @@ class WindowAttention(nn.Module):
                     B, T, nWh, nWw, 3, C).permute(4, 0, 1, 5, 2,
                                                   3).view(3, -1, C, nWh,
                                                           nWw).contiguous()
-                k_pooled_k, v_pooled_k = qkv_pooled[1], qkv_pooled[
-                    2]  # B*T, C, nWh, nWw
+                # B*T, C, nWh, nWw
+                k_pooled_k, v_pooled_k = qkv_pooled[1], qkv_pooled[2]
                 # k_pooled_k shape: [5, 512, 4, 4]
                 # self.unfolds[k](k_pooled_k) shape: [5, 23040 (512 * 5 * 9 ), 16]
 
                 (k_pooled_k, v_pooled_k) = map(
-                    lambda t: self.unfolds[k](t).view(
-                    B, T, C, self.unfolds[k].kernel_size[0], self.unfolds[k].kernel_size[1], -1).permute(0, 5, 1, 3, 4, 2).contiguous().\
-                    view(-1, T, self.unfolds[k].kernel_size[0]*self.unfolds[k].kernel_size[1], self.num_heads, C // self.num_heads).permute(0, 3, 1, 2, 4).contiguous(),
-                    (k_pooled_k, v_pooled_k)  # (B x (nH*nW)) x nHeads x T x (unfold_wsize x unfold_wsize) x head_dim
-                )
+                    lambda t: self.unfolds[k]
+                    (t).view(B, T, C, self.unfolds[k].kernel_size[0], self.
+                             unfolds[k].kernel_size[1], -1)
+                    .permute(0, 5, 1, 3, 4, 2).contiguous().view(
+                        -1, T, self.unfolds[k].kernel_size[0] * self.unfolds[
+                            k].kernel_size[1], self.num_heads, C // self.
+                        num_heads).permute(0, 3, 1, 2, 4).contiguous(),
+                    # (B x (nH*nW)) x nHeads x T x (unfold_wsize x unfold_wsize) x head_dim
+                    (k_pooled_k, v_pooled_k))
                 # k_pooled_k shape : [16, 4, 5, 45, 128]
 
                 # select valid unfolding index
@@ -358,9 +384,8 @@ class WindowAttention(nn.Module):
 
         N = k_all.shape[-2]
         q_windows = q_windows * self.scale
-        attn = (
-            q_windows @ k_all.transpose(-2, -1)
-        )  # B*nW, nHead, T*window_size*window_size, T*focal_window_size*focal_window_size
+        # B*nW, nHead, T*window_size*window_size, T*focal_window_size*focal_window_size
+        attn = (q_windows @ k_all.transpose(-2, -1))
         # T * 45
         window_area = T * self.window_size[0] * self.window_size[1]
         # T * 165
@@ -377,7 +402,8 @@ class WindowAttention(nn.Module):
                 if mask_all[k + 1] is not None:
                     attn[:, :, :window_area, offset:(offset + (T*bias[0]*bias[1]))] = \
                         attn[:, :, :window_area, offset:(offset + (T*bias[0]*bias[1]))] + \
-                            mask_all[k+1][:, :, None, None, :].repeat(attn.shape[0] // mask_all[k+1].shape[1], 1, 1, 1, 1).view(-1, 1, 1, mask_all[k+1].shape[-1])
+                        mask_all[k+1][:, :, None, None, :].repeat(
+                            attn.shape[0] // mask_all[k+1].shape[1], 1, 1, 1, 1).view(-1, 1, 1, mask_all[k+1].shape[-1])
 
                 offset += T * bias[0] * bias[1]
 
@@ -464,6 +490,9 @@ class TemporalFocalTransformerBlock(nn.Module):
         self.mlp = FusionFeedForward(dim, n_vecs=n_vecs, t2t_params=t2t_params)
 
     def forward(self, x):
+        output_size = x[1]
+        x = x[0]
+
         B, T, H, W, C = x.shape
 
         shortcut = x
@@ -518,9 +547,8 @@ class TemporalFocalTransformerBlock(nn.Module):
                 x_windows_all += [x_windows_pooled]
                 x_window_masks_all += [None]
 
-        attn_windows = self.attn(
-            x_windows_all,
-            mask_all=x_window_masks_all)  # nW*B, T*window_size*window_size, C
+        # nW*B, T*window_size*window_size, C
+        attn_windows = self.attn(x_windows_all, mask_all=x_window_masks_all)
 
         # merge windows
         attn_windows = attn_windows.view(-1, T, self.window_size[0],
@@ -531,6 +559,7 @@ class TemporalFocalTransformerBlock(nn.Module):
         # FFN
         x = shortcut + shifted_x
         y = self.norm2(x)
-        x = x + self.mlp(y.view(B, T * H * W, C)).view(B, T, H, W, C)
+        x = x + self.mlp(y.view(B, T * H * W, C), output_size).view(
+            B, T, H, W, C)
 
-        return x
+        return x, output_size
